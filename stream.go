@@ -2,167 +2,172 @@ package kafka
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"log"
+	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/artyomturkin/go-stream"
-	"github.com/hashicorp/go-hclog"
-	k "github.com/segmentio/kafka-go"
+	kg "github.com/segmentio/kafka-go"
 	"golang.org/x/sync/semaphore"
 )
 
-type streamController struct {
-	s                  *semaphore.Weighted
-	uc                 *stream.WireConfig
-	breakOnFormatError bool
-	brokers            []string
-	topic              string
-	log                hclog.Logger
+type kstream struct {
+	c stream.Config
 }
 
-// New create new stream from config
-func New(c stream.Config) stream.Stream {
-	return &streamController{
-		s:                  semaphore.NewWeighted(int64(c.MaxInflightMessages)),
-		uc:                 c.WireConfig,
-		breakOnFormatError: c.ForwardUnmarshalErrors,
-		brokers:            c.Endpoints,
-		topic:              c.Topic,
-		log:                c.Logger.Named("kafka").With("topic", c.Topic),
-	}
-}
+var _ stream.Stream = &kstream{}
+var _ stream.Producer = &kConsumerProducer{}
+var _ stream.Consumer = &kConsumerProducer{}
 
-// Ensure that streamController implements stream.Stream interface
-var _ stream.Stream = (*streamController)(nil)
-
-func (s *streamController) GetConsumer(group string) stream.Consumer {
-	r := k.NewReader(k.ReaderConfig{
-		Brokers:       s.brokers,
-		Topic:         s.topic,
+func (s *kstream) GetConsumer(ctx context.Context, group string) stream.Consumer {
+	r := kg.NewReader(kg.ReaderConfig{
+		Brokers:       s.c.Endpoints,
+		Topic:         s.c.Topic,
 		GroupID:       group,
-		QueueCapacity: 1,
+		QueueCapacity: s.c.MaxInflightMessages,
 		RetentionTime: 7 * 24 * time.Hour,
 	})
-	return &consumer{
-		s:                  s.s,
-		r:                  r,
-		uc:                 s.uc,
-		breakOnFormatError: s.breakOnFormatError,
-		log:                s.log.With("direction", "consumer", "group", group),
+	return &kConsumerProducer{
+		s: semaphore.NewWeighted(int64(s.c.MaxInflightMessages)),
+		r: r,
 	}
 }
 
-func (s *streamController) GetProducer(group string) stream.Producer {
-	w := k.NewWriter(k.WriterConfig{
-		Brokers: s.brokers,
-		Topic:   s.topic,
+func (s *kstream) GetProducer(ctx context.Context, group string) stream.Producer {
+	w := kg.NewWriter(kg.WriterConfig{
+		Brokers: s.c.Endpoints,
+		Topic:   s.c.Topic,
 	})
-	return &producer{
-		w:   w,
-		uc:  s.uc,
-		log: s.log.With("direction", "producer", "group", group),
+	return &kConsumerProducer{
+		w:        w,
+		producer: true,
 	}
 }
 
-type consumer struct {
-	s                  *semaphore.Weighted
-	r                  *k.Reader
-	uc                 *stream.WireConfig
-	breakOnFormatError bool
-	log                hclog.Logger
+// New create new kafka stream
+func New(c stream.Config) stream.Stream {
+	return &kstream{}
 }
 
-func (c *consumer) Read(ctx context.Context) (*stream.Message, error) {
-	log.Printf("[KAFKA] Read - acquire thread")
-	err := c.s.Acquire(ctx, 1)
-	if err != nil {
-		return nil, err
+type kConsumerProducer struct {
+	sync.Mutex
+	s *semaphore.Weighted
+
+	running  bool
+	producer bool
+
+	r *kg.Reader
+	w *kg.Writer
+
+	msgs chan stream.Message
+	errs chan error
+	done chan struct{}
+}
+
+func (k *kConsumerProducer) Close() error {
+	defer close(k.errs)
+
+	if k.producer {
+		defer close(k.done)
 	}
 
-	c.log.Debug("thread acquired")
+	return k.r.Close()
+}
+
+func (k *kConsumerProducer) Errors() <-chan error {
+	return k.errs
+}
+
+func (k *kConsumerProducer) Done() <-chan struct{} {
+	return k.done
+}
+
+func (k *kConsumerProducer) Ack(ctx context.Context) error {
+	defer k.s.Release(1)
+
+	tracks := stream.GetTrackers(ctx)
+
+	msgs := []kg.Message{}
+	for _, t := range tracks {
+		if msg, ok := t.(kg.Message); ok {
+			msgs = append(msgs, msg)
+		}
+	}
+
+	if err := k.r.CommitMessages(ctx, msgs...); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (k *kConsumerProducer) Nack(ctx context.Context) error {
+	k.s.Release(1)
+	return nil
+}
+
+func (k *kConsumerProducer) Messages() <-chan stream.Message {
+	return k.msgs
+}
+
+func (k *kConsumerProducer) run(ctx context.Context) {
+	k.Lock()
+	if k.running {
+		k.Unlock()
+		return
+	}
+
+	k.running = true
+
+	k.msgs = make(chan stream.Message)
+	defer close(k.msgs)
+
+	k.errs = make(chan error)
+
+	k.done = make(chan struct{})
+	defer close(k.done)
+
+	k.Unlock()
 
 	for {
-		c.log.Debug("read message")
-
-		m, err := c.r.FetchMessage(ctx)
+		err := k.s.Acquire(ctx, 1)
 		if err != nil {
-			c.log.Error("read error", "error", err)
-			return nil, err
+			k.errs <- err
+			return
 		}
 
-		msg, err := stream.UnmarshalMessage(m.Value, c.uc)
-		if err == nil {
-			c.log.Debug("forward message", "partition", m.Partition, "eventID", msg.ID)
-			msg.StreamMeta = m
-			return msg, nil
-		}
-
-		c.log.Error("unmarshaling error", "error", err)
-		if c.breakOnFormatError {
-			return nil, err
-		}
-
-		c.log.Debug("skipping")
-		err = c.r.CommitMessages(ctx, m)
+		m, err := k.r.FetchMessage(ctx)
 		if err != nil {
-			c.log.Error("skipping error", "error", err)
-			return nil, fmt.Errorf("failed to commit skipped message")
+			k.errs <- err
+			return
+		}
+
+		var msg map[string]interface{}
+		err = json.Unmarshal(m.Value, &msg)
+		if err != nil {
+			k.errs <- err
+			k.s.Release(1)
+		} else {
+			k.msgs <- stream.Message{
+				Context: stream.SetTrackers(ctx, m),
+				Data:    msg,
+			}
 		}
 	}
 }
-func (c *consumer) Ack(ctx context.Context, m *stream.Message) error {
-	c.log.Debug("release thread", "eventID", m.ID)
-	defer c.s.Release(1)
-	if msg, ok := m.StreamMeta.(k.Message); ok {
-		err := c.r.CommitMessages(ctx, msg)
-		if err != nil {
-			c.log.Error("failed to ack message", "eventID", m.ID, "error", err)
-			return err
-		}
-		c.log.Debug("ack success", "eventID", m.ID)
-		return nil
-	}
 
-	c.log.Error("StreamMeta is not formated correctly", "eventID", m.ID)
-	return errors.New("StreamMeta is not formated correctly")
-}
-
-func (c *consumer) Nack(context.Context, *stream.Message) error {
-	c.log.Debug("release thread")
-	c.s.Release(1)
-	return nil
-}
-
-func (c *consumer) Close() error {
-	return c.r.Close()
-}
-
-type producer struct {
-	w   *k.Writer
-	uc  *stream.WireConfig
-	log hclog.Logger
-}
-
-func (p *producer) Publish(ctx context.Context, m *stream.Message) error {
-	l := p.log.With("eventID", m.ID)
-	data, err := stream.MarshalMessage(m, p.uc)
+func (k *kConsumerProducer) Publish(ctx context.Context, m interface{}) error {
+	b, err := json.Marshal(m)
 	if err != nil {
-		l.Error("failed to marshal message", "error", err)
+		k.errs <- err
 		return err
 	}
 
-	err = p.w.WriteMessages(ctx, k.Message{Value: data.([]byte)})
+	err = k.w.WriteMessages(ctx, kg.Message{Value: b})
 	if err != nil {
-		l.Error("failed to publish message", "error", err)
+		k.errs <- err
 		return err
 	}
 
-	l.Debug("publish success")
 	return nil
-}
-
-func (p *producer) Close() error {
-	return p.w.Close()
 }
