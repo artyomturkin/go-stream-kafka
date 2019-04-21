@@ -33,6 +33,7 @@ func (s *kstream) GetConsumer(ctx context.Context, group string) stream.Consumer
 		errs:    make(chan error),
 		done:    make(chan struct{}),
 		errSubs: []chan error{},
+		msgs:    make(chan stream.Message),
 	}
 	go k.run(ctx)
 	go k.forwardErrors()
@@ -149,10 +150,7 @@ func (k *kConsumerProducer) run(ctx context.Context) {
 	}
 
 	k.running = true
-
-	k.msgs = make(chan stream.Message)
 	defer close(k.msgs)
-
 	k.Unlock()
 
 	var err error
@@ -189,7 +187,7 @@ func (k *kConsumerProducer) run(ctx context.Context) {
 			return
 		}
 
-		var msg map[string]interface{}
+		var msg interface{}
 		err = json.Unmarshal(m.Value, &msg)
 		if err != nil {
 			k.errs <- err

@@ -1,0 +1,39 @@
+---
+kind: pipeline
+name: test-e2e
+
+# workspace:
+#   base: /go
+#   path: src/github.com/artyomturkin/go-stream-sql
+
+steps:
+- name: test-e2e
+  image: golang
+  environment:
+    TEST_KAFKA_BROKER: kafka:9092
+  commands:
+  - go mod download
+  - sleep 10
+  - go test -timeout 150s . -run '^(TestE2E)$' -count 2
+
+services:
+- name: zookeeper
+  image: confluentinc/cp-zookeeper:latest
+  environment:
+    ZOOKEEPER_CLIENT_PORT: 2181
+    ZOOKEEPER_TICK_TIME: 2000
+    ZOOKEEPER_LOG4J_LOGGERS: kafka.controller=ERROR,state.change.logger=ERROR
+
+- name: kafka
+  image: confluentinc/cp-kafka:latest
+  ports:
+  - 9092
+  environment:
+    KAFKA_BROKER_ID: 1
+    KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+    KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://kafka:9092
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+    KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    KAFKA_LOG4J_LOGGERS: kafka.controller=ERROR,state.change.logger=ERROR
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
