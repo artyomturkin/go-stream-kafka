@@ -95,8 +95,8 @@ func TestE2E(t *testing.T) {
 	log.Printf("finished consuming")
 
 	log.Printf("Cancel")
-
 	cancel()
+	log.Printf("Wait Done")
 	<-cs.Done()
 
 	log.Printf("Run checks")

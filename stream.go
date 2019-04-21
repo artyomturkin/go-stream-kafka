@@ -20,39 +20,33 @@ var _ stream.Producer = &kConsumerProducer{}
 var _ stream.Consumer = &kConsumerProducer{}
 
 func (s *kstream) GetConsumer(ctx context.Context, group string) stream.Consumer {
-	r := kg.NewReader(kg.ReaderConfig{
+	k := prep()
+
+	k.s = semaphore.NewWeighted(int64(s.c.MaxInflightMessages))
+	k.r = kg.NewReader(kg.ReaderConfig{
 		Brokers:       s.c.Endpoints,
 		Topic:         s.c.Topic,
 		GroupID:       group,
 		QueueCapacity: s.c.MaxInflightMessages,
 		RetentionTime: 7 * 24 * time.Hour,
 	})
-	k := &kConsumerProducer{
-		s:       semaphore.NewWeighted(int64(s.c.MaxInflightMessages)),
-		r:       r,
-		errs:    make(chan error),
-		done:    make(chan struct{}),
-		errSubs: []chan error{},
-		msgs:    make(chan stream.Message),
-	}
-	go k.run(ctx)
-	go k.forwardErrors()
+	k.consumerContext, k.consumerCancel = context.WithCancel(ctx)
+	k.consumerWG = &sync.WaitGroup{}
+	k.consumerWG.Add(1)
+
+	go k.run()
+
 	return k
 }
 
 func (s *kstream) GetProducer(ctx context.Context, group string) stream.Producer {
-	w := kg.NewWriter(kg.WriterConfig{
+	k := prep()
+
+	k.w = kg.NewWriter(kg.WriterConfig{
 		Brokers: s.c.Endpoints,
 		Topic:   s.c.Topic,
 	})
-	k := &kConsumerProducer{
-		w:        w,
-		producer: true,
-		errs:     make(chan error),
-		done:     make(chan struct{}),
-		errSubs:  []chan error{},
-	}
-	go k.forwardErrors()
+
 	return k
 }
 
@@ -67,9 +61,7 @@ type kConsumerProducer struct {
 	sync.RWMutex
 	s *semaphore.Weighted
 
-	running  bool
-	closed   bool
-	producer bool
+	closed bool
 
 	r *kg.Reader
 	w *kg.Writer
@@ -79,19 +71,52 @@ type kConsumerProducer struct {
 	done chan struct{}
 
 	errSubs []chan error
+
+	consumerContext context.Context
+	consumerCancel  func()
+	consumerWG      *sync.WaitGroup
+	errsWG          *sync.WaitGroup
+}
+
+func prep() *kConsumerProducer {
+	k := &kConsumerProducer{
+		errs:    make(chan error),
+		done:    make(chan struct{}),
+		errSubs: []chan error{},
+		msgs:    make(chan stream.Message),
+		errsWG:  &sync.WaitGroup{},
+	}
+	k.errsWG.Add(1)
+	go k.forwardErrors()
+	return k
 }
 
 func (k *kConsumerProducer) Close() error {
 	k.Lock()
-	defer k.Unlock()
 
 	if !k.closed {
 		k.closed = true
-		defer close(k.errs)
-		defer close(k.done)
+		k.Unlock()
+
+		if k.consumerCancel != nil {
+
+			k.consumerCancel()
+			k.consumerWG.Wait()
+		}
+
+		close(k.errs)
+		k.errsWG.Wait()
+
+		close(k.done)
+	} else {
+		k.Unlock()
 	}
 
-	return k.r.Close()
+	if k.r != nil {
+		return k.r.Close()
+	}
+
+	return k.w.Close()
 }
 
 func (k *kConsumerProducer) Errors() <-chan error {
@@ -140,29 +165,11 @@ func (k *kConsumerProducer) Messages() <-chan stream.Message {
 	return k.msgs
 }
 
-func (k *kConsumerProducer) run(ctx context.Context) {
+func (k *kConsumerProducer) run() {
 	defer k.Close()
+	defer k.consumerWG.Done()
 
-	k.Lock()
-	if k.running {
-		k.Unlock()
-		return
-	}
-
-	k.running = true
-	defer close(k.msgs)
-	k.Unlock()
-
-	var err error
-	for _, br := range k.r.Config().Brokers {
-		con, errl := kg.Dial("tcp", br)
-		if errl != nil {
-			err = errl
-			continue
-		}
-		con.Close()
-		break
-	}
+	err := ping(k.r.Config().Brokers)
 
 	if err != nil {
 		k.errs <- err
@@ -170,20 +177,15 @@ func (k *kConsumerProducer) run(ctx context.Context) {
 	}
 
 	for {
-		err := k.s.Acquire(ctx, 1)
-		k.RLock()
+		err := k.s.Acquire(k.consumerContext, 1)
 		if err != nil {
 			k.errs <- err
-			k.RUnlock()
 			return
 		}
-		k.RUnlock()
 
-		m, err := k.r.FetchMessage(ctx)
-		k.RLock()
+		m, err := k.r.FetchMessage(k.consumerContext)
 		if err != nil {
 			k.errs <- err
-			k.RUnlock()
 			return
 		}
 
@@ -193,18 +195,25 @@ func (k *kConsumerProducer) run(ctx context.Context) {
 			k.errs <- err
 			k.s.Release(1)
 		} else {
-			k.msgs <- stream.Message{
-				Context: stream.SetTrackers(ctx, m),
+			select {
+			case k.msgs <- stream.Message{
+				Context: stream.SetTrackers(k.consumerContext, m),
 				Data:    msg,
+			}:
+			case <-k.consumerContext.Done():
+				return
 			}
 		}
-		k.RUnlock()
 	}
 }
 
 func (k *kConsumerProducer) Publish(ctx context.Context, m interface{}) error {
 	k.RLock()
 	defer k.RUnlock()
+
+	if k.closed {
+		return context.Canceled
+	}
 
 	b, err := json.Marshal(m)
 	if err != nil {
@@ -222,6 +231,8 @@ func (k *kConsumerProducer) Publish(ctx context.Context, m interface{}) error {
 }
 
 func (k *kConsumerProducer) forwardErrors() {
+	defer k.errsWG.Done()
+
 	for {
 		err, more := <-k.errs
 
@@ -242,8 +253,21 @@ func (k *kConsumerProducer) forwardErrors() {
 			for _, sub := range k.errSubs {
 				close(sub)
 			}
-			k.errSubs = []chan error{}
 			return
 		}
 	}
+}
+
+func ping(brokers []string) error {
+	var err error
+	for _, br := range brokers {
+		con, errl := kg.Dial("tcp", br)
+		if errl != nil {
+			err = errl
+			continue
+		}
+		con.Close()
+		break
+	}
+	return err
 }

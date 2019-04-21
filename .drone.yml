@@ -1,10 +1,18 @@
 ---
 kind: pipeline
-name: test-e2e
+name: test-units
 
-# workspace:
-#   base: /go
-#   path: src/github.com/artyomturkin/go-stream-sql
+steps:
+- name: test-units
+  image: golang
+  commands:
+  - go mod download
+  - go test -timeout 30s . -run '^(TestConsumerTimeout)$' -count 3
+  - go test -timeout 60s . -run '^(TestProducerTimeout)$' -count 3
+
+---
+kind: pipeline
+name: test-e2e
 
 steps:
 - name: test-e2e
