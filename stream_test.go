@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/artyomturkin/go-stream"
 	kafka "github.com/artyomturkin/go-stream-kafka"
@@ -57,8 +58,13 @@ func TestE2E(t *testing.T) {
 		}
 	}
 
+	time.Sleep(3 * time.Second)
 	cancel()
 	<-cs.Done()
+
+	if len(msgs) != 20 {
+		t.Errorf("expected 20 msgs, got %d", len(msgs))
+	}
 }
 
 func TestProducerTimeout(t *testing.T) {
