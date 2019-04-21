@@ -61,7 +61,8 @@ func TestE2E(t *testing.T) {
 	<-cs.Done()
 }
 
-func TestProducerTimeOut(t *testing.T) {
+func TestProducerTimeout(t *testing.T) {
+	t.Parallel()
 
 	ks := kafka.New(stream.Config{
 		Endpoints: []string{"nohost:9092"},
@@ -78,6 +79,8 @@ func TestProducerTimeOut(t *testing.T) {
 }
 
 func TestConsumerTimeout(t *testing.T) {
+	t.Parallel()
+
 	ks := kafka.New(stream.Config{
 		Endpoints:           []string{"nohost:9092"},
 		MaxInflightMessages: 10,

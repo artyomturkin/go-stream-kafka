@@ -63,7 +63,7 @@ func New(c stream.Config) stream.Stream {
 }
 
 type kConsumerProducer struct {
-	sync.Mutex
+	sync.RWMutex
 	s *semaphore.Weighted
 
 	running  bool
@@ -173,14 +173,19 @@ func (k *kConsumerProducer) run(ctx context.Context) {
 
 	for {
 		err := k.s.Acquire(ctx, 1)
+		k.RLock()
 		if err != nil {
 			k.errs <- err
+			k.RUnlock()
 			return
 		}
+		k.RUnlock()
 
 		m, err := k.r.FetchMessage(ctx)
+		k.RLock()
 		if err != nil {
 			k.errs <- err
+			k.RUnlock()
 			return
 		}
 
@@ -195,20 +200,21 @@ func (k *kConsumerProducer) run(ctx context.Context) {
 				Data:    msg,
 			}
 		}
+		k.RUnlock()
 	}
 }
 
 func (k *kConsumerProducer) Publish(ctx context.Context, m interface{}) error {
+	k.RLock()
+	defer k.RUnlock()
+
 	b, err := json.Marshal(m)
 	if err != nil {
 		k.errs <- err
 		return err
 	}
 
-	tctx, cancel := context.WithTimeout(ctx, 40*time.Second)
-	defer cancel()
-
-	err = k.w.WriteMessages(tctx, kg.Message{Value: b})
+	err = k.w.WriteMessages(ctx, kg.Message{Value: b})
 	if err != nil {
 		k.errs <- err
 		return err
@@ -221,9 +227,9 @@ func (k *kConsumerProducer) forwardErrors() {
 	for {
 		err, more := <-k.errs
 
-		k.Lock()
+		k.RLock()
 		subs := k.errSubs[:]
-		k.Unlock()
+		k.RUnlock()
 
 		if more {
 			for _, s := range subs {
