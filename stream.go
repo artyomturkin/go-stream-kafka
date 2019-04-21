@@ -27,10 +27,16 @@ func (s *kstream) GetConsumer(ctx context.Context, group string) stream.Consumer
 		QueueCapacity: s.c.MaxInflightMessages,
 		RetentionTime: 7 * 24 * time.Hour,
 	})
-	return &kConsumerProducer{
-		s: semaphore.NewWeighted(int64(s.c.MaxInflightMessages)),
-		r: r,
+	k := &kConsumerProducer{
+		s:       semaphore.NewWeighted(int64(s.c.MaxInflightMessages)),
+		r:       r,
+		errs:    make(chan error),
+		done:    make(chan struct{}),
+		errSubs: []chan error{},
 	}
+	go k.run(ctx)
+	go k.forwardErrors()
+	return k
 }
 
 func (s *kstream) GetProducer(ctx context.Context, group string) stream.Producer {
@@ -38,15 +44,22 @@ func (s *kstream) GetProducer(ctx context.Context, group string) stream.Producer
 		Brokers: s.c.Endpoints,
 		Topic:   s.c.Topic,
 	})
-	return &kConsumerProducer{
+	k := &kConsumerProducer{
 		w:        w,
 		producer: true,
+		errs:     make(chan error),
+		done:     make(chan struct{}),
+		errSubs:  []chan error{},
 	}
+	go k.forwardErrors()
+	return k
 }
 
 // New create new kafka stream
 func New(c stream.Config) stream.Stream {
-	return &kstream{}
+	return &kstream{
+		c: c,
+	}
 }
 
 type kConsumerProducer struct {
@@ -54,6 +67,7 @@ type kConsumerProducer struct {
 	s *semaphore.Weighted
 
 	running  bool
+	closed   bool
 	producer bool
 
 	r *kg.Reader
@@ -62,12 +76,17 @@ type kConsumerProducer struct {
 	msgs chan stream.Message
 	errs chan error
 	done chan struct{}
+
+	errSubs []chan error
 }
 
 func (k *kConsumerProducer) Close() error {
-	defer close(k.errs)
+	k.Lock()
+	defer k.Unlock()
 
-	if k.producer {
+	if !k.closed {
+		k.closed = true
+		defer close(k.errs)
 		defer close(k.done)
 	}
 
@@ -75,7 +94,17 @@ func (k *kConsumerProducer) Close() error {
 }
 
 func (k *kConsumerProducer) Errors() <-chan error {
-	return k.errs
+	errch := make(chan error)
+
+	k.Lock()
+	defer k.Unlock()
+
+	if !k.closed {
+		k.errSubs = append(k.errSubs, errch)
+	} else {
+		close(errch)
+	}
+	return errch
 }
 
 func (k *kConsumerProducer) Done() <-chan struct{} {
@@ -111,6 +140,8 @@ func (k *kConsumerProducer) Messages() <-chan stream.Message {
 }
 
 func (k *kConsumerProducer) run(ctx context.Context) {
+	defer k.Close()
+
 	k.Lock()
 	if k.running {
 		k.Unlock()
@@ -122,12 +153,23 @@ func (k *kConsumerProducer) run(ctx context.Context) {
 	k.msgs = make(chan stream.Message)
 	defer close(k.msgs)
 
-	k.errs = make(chan error)
-
-	k.done = make(chan struct{})
-	defer close(k.done)
-
 	k.Unlock()
+
+	var err error
+	for _, br := range k.r.Config().Brokers {
+		con, errl := kg.Dial("tcp", br)
+		if errl != nil {
+			err = errl
+			continue
+		}
+		con.Close()
+		break
+	}
+
+	if err != nil {
+		k.errs <- err
+		return
+	}
 
 	for {
 		err := k.s.Acquire(ctx, 1)
@@ -163,11 +205,41 @@ func (k *kConsumerProducer) Publish(ctx context.Context, m interface{}) error {
 		return err
 	}
 
-	err = k.w.WriteMessages(ctx, kg.Message{Value: b})
+	tctx, cancel := context.WithTimeout(ctx, 40*time.Second)
+	defer cancel()
+
+	err = k.w.WriteMessages(tctx, kg.Message{Value: b})
 	if err != nil {
 		k.errs <- err
 		return err
 	}
 
 	return nil
+}
+
+func (k *kConsumerProducer) forwardErrors() {
+	for {
+		err, more := <-k.errs
+
+		k.Lock()
+		subs := k.errSubs[:]
+		k.Unlock()
+
+		if more {
+			for _, s := range subs {
+
+				select {
+				case s <- err:
+				default:
+				}
+
+			}
+		} else {
+			for _, sub := range k.errSubs {
+				close(sub)
+			}
+			k.errSubs = []chan error{}
+			return
+		}
+	}
 }
