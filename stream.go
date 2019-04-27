@@ -78,6 +78,11 @@ type kConsumerProducer struct {
 	errsWG          *sync.WaitGroup
 }
 
+type kTrack struct {
+	m   kg.Message
+	msg interface{}
+}
+
 func prep() *kConsumerProducer {
 	k := &kConsumerProducer{
 		errs:    make(chan error),
@@ -144,8 +149,8 @@ func (k *kConsumerProducer) Ack(ctx context.Context) error {
 
 	msgs := []kg.Message{}
 	for _, t := range tracks {
-		if msg, ok := t.(kg.Message); ok {
-			msgs = append(msgs, msg)
+		if msg, ok := t.(kTrack); ok {
+			msgs = append(msgs, msg.m)
 		}
 	}
 
@@ -157,7 +162,21 @@ func (k *kConsumerProducer) Ack(ctx context.Context) error {
 }
 
 func (k *kConsumerProducer) Nack(ctx context.Context) error {
-	k.s.Release(1)
+	tracks := stream.GetTrackers(ctx)
+
+	for _, t := range tracks {
+		if tr, ok := t.(kTrack); ok {
+			select {
+			case k.msgs <- stream.Message{
+				Context: stream.SetTrackers(k.consumerContext, kTrack{m: tr.m, msg: tr.msg}),
+				Data:    tr.msg,
+			}:
+			case <-k.consumerContext.Done():
+				return context.Canceled
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -197,7 +216,7 @@ func (k *kConsumerProducer) run() {
 		} else {
 			select {
 			case k.msgs <- stream.Message{
-				Context: stream.SetTrackers(k.consumerContext, m),
+				Context: stream.SetTrackers(k.consumerContext, kTrack{m: m, msg: msg}),
 				Data:    msg,
 			}:
 			case <-k.consumerContext.Done():
