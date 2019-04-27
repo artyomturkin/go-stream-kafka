@@ -4,7 +4,7 @@ Kafka stream provider for go-stream package
 Add to `go.mod`
 
 ```
-require github.com/artyomturkin/go-stream-kafka v1.0.0
+require github.com/artyomturkin/go-stream-kafka v1.1.0
 ```
 
 Then import package in code:
